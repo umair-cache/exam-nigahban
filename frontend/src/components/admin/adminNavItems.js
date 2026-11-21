@@ -1,0 +1,50 @@
+import {
+  AuditIcon,
+  DashboardIcon,
+  ExamsIcon,
+  FileIcon,
+  MonitoringIcon,
+  ShieldAlertIcon,
+  TrashIcon,
+  UsersIcon,
+} from './icons'
+
+// Single source of truth for the admin sidebar's navigation, reused by
+// AdminSidebar (the link list) and AdminLayout (the header's current-page
+// title lookup) so the routes/labels/icons are never duplicated across the
+// two.
+//
+// Students and Administrators were consolidated into one Users entry
+// (/admin/users, UsersPage.jsx). The old /admin/students and
+// /admin/administrators addresses redirect there (App.jsx).
+export const ADMIN_NAV_ITEMS = [
+  { to: '/admin', end: true, label: 'Dashboard', Icon: DashboardIcon },
+  { to: '/admin/monitoring', label: 'Monitoring Events', Icon: MonitoringIcon },
+  { to: '/admin/enforcement', label: 'Enforcement', Icon: ShieldAlertIcon },
+  { to: '/admin/exams', label: 'Exams', Icon: ExamsIcon },
+  { to: '/admin/users', label: 'Users', Icon: UsersIcon },
+  { to: '/admin/reports', label: 'Reports', Icon: FileIcon },
+  { to: '/admin/audit', label: 'Audit History', Icon: AuditIcon },
+  // Only the system administrator can void a record or read the list of
+  // what has been voided, so the link is hidden from everyone else
+  // rather than leading them to a page that refuses them.
+  { to: '/admin/voided', label: 'Voided Records', Icon: TrashIcon, systemAdminOnly: true },
+]
+
+// Resolves the header's current-page title from the route pathname. Exact
+// matches win first (so "/admin" only labels itself, not every admin
+// route); otherwise the longest matching prefix wins, so a nested route
+// like /admin/exams/:examId/questions still labels itself "Exams" instead
+// of falling through to a generic default.
+export function getAdminPageTitle(pathname) {
+  const exact = ADMIN_NAV_ITEMS.find((item) => item.to === pathname)
+  if (exact) {
+    return exact.label
+  }
+
+  const prefixMatch = ADMIN_NAV_ITEMS.filter(
+    (item) => item.to !== '/admin' && pathname.startsWith(`${item.to}/`)
+  ).sort((a, b) => b.to.length - a.to.length)[0]
+
+  return prefixMatch?.label ?? 'Admin Panel'
+}

@@ -1,0 +1,52 @@
+"""Centralized monitoring configuration shared by the event-ingestion API.
+
+Mirrors the baseline temporal-rule table documented in the README so
+thresholds are not duplicated across the codebase. The browser-side temporal
+rule engine (frontend/src/monitoring/constants.js) applies these same
+baseline values before an event ever reaches the backend; this module is
+used here only to validate that an incoming event's type/severity are
+recognized, not to re-run temporal logic server-side.
+"""
+
+# Face-monitoring activity types (Phase 5B/5C) plus mobile-phone detection
+# (YOLO -- Milestone 6 Phase 2 Step 5; the browser-side YOLOX Worker
+# pipeline and its own isolated temporal rule engine were added in Steps
+# 1-3, frontend-only until this step).
+ALLOWED_EVENT_TYPES = {
+    "HEAD_LEFT",
+    "HEAD_RIGHT",
+    "HEAD_UP",
+    "HEAD_DOWN",
+    "LOOKING_AWAY",
+    "FACE_ABSENT",
+    "MULTIPLE_FACES",
+    "MOBILE_PHONE",
+    # The exam page stopped being the active screen (another tab, window,
+    # app or monitor). Detected by the browser's visibility/focus signals,
+    # not by the camera -- see frontend/src/monitoring/focusMonitor.js.
+    "LEFT_EXAM_SCREEN",
+    # The candidate stopped sharing their entire screen during an exam that
+    # requires it (Exam.require_screen_share).
+    "SCREEN_SHARE_STOPPED",
+}
+
+ALLOWED_SEVERITIES = {"low", "medium", "high"}
+
+DEFAULT_SEVERITY_BY_EVENT_TYPE = {
+    "HEAD_LEFT": "medium",
+    "HEAD_RIGHT": "medium",
+    "HEAD_UP": "medium",
+    "HEAD_DOWN": "medium",
+    "LOOKING_AWAY": "medium",
+    "FACE_ABSENT": "high",
+    "MULTIPLE_FACES": "high",
+    "LEFT_EXAM_SCREEN": "medium",
+    "SCREEN_SHARE_STOPPED": "high",
+}
+
+# Screenshots attached to one LEFT_EXAM_SCREEN event: the first about 1 s
+# after leaving, then every 5 s while away. Must match
+# SCREEN_CAPTURE_MAX_PER_ABSENCE in frontend/src/monitoring/constants.js.
+MAX_SCREEN_CAPTURES_PER_EVENT = 6
+
+MONITORING_EVENT_SOURCE = "browser_mediapipe"

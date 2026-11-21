@@ -1,0 +1,11 @@
+{
+  "name": "Exam Nigahban",
+  "short_name": "Nigahban",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "theme_color": "#4656A8",
+  "background_color": "#F8FAFC",
+  "display": "standalone",
+  "start_url": "/"
+}

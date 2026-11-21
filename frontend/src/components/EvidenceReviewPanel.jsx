@@ -1,0 +1,591 @@
+import { useEffect, useState } from 'react'
+import { fetchEvidenceImageBlob, reviewEvidence } from '../api/evidence'
+import { reviewMonitoringEvent } from '../api/monitoring'
+import ScreenCaptureTimeline from './admin/ScreenCaptureTimeline'
+import { createEnforcementAction, listEnforcementActions } from '../api/enforcement'
+import {
+  actionTypeBadgeClass,
+  actionTypeLabel,
+  enforcementStatusBadgeClass,
+  enforcementStatusLabel,
+} from '../utils/enforcementStatus'
+import { getErrorMessage } from '../utils/apiError'
+import { voidMonitoringEvent } from '../api/void'
+import VoidConfirmDialog from './admin/VoidConfirmDialog'
+import {
+  eventStatusBadgeClass,
+  eventStatusLabel,
+  eventTypeLabel,
+  severityBadgeClass,
+  severityLabel,
+} from '../utils/monitoringStatus'
+import { formatDateTimePKT } from '../utils/dateFormat'
+import ConfirmModal from './ConfirmModal'
+
+// Renders the evidence image for `event.evidence_id` and lets an admin
+// record a CONFIRMED/IGNORED decision. The image endpoint requires the same
+// JWT bearer auth as every other admin request, so it is fetched as a blob
+// through the authenticated apiClient (see api/evidence.js) rather than
+// loaded via a plain <img src="...">, and the resulting object URL is
+// always revoked on unmount/close/event-change to avoid leaking memory.
+//
+// For a CONFIRMED event it additionally offers the enforcement ladder
+// (pause / cancel / UFM case) -- punishment is only reachable after a
+// human has confirmed the evidence, never straight from an alert.
+//
+// Confirming happens IN PLACE: the panel stays open and reveals the
+// enforcement section, rather than closing and forcing the admin to find
+// and reopen the same event just to act on it. The human-gating rule is
+// unchanged by this -- enforcement still appears only once the server has
+// actually recorded a CONFIRMED decision, never on the strength of a
+// client-side guess.
+//
+// `onReviewed` means "finished with this event -- close and refetch";
+// `onRefresh` means "the list is stale, refetch it but leave me open".
+export default function EvidenceReviewPanel({
+  event,
+  onClose,
+  onReviewed,
+  onRefresh,
+  // Whether to offer the void control. Passed in rather than read from
+  // auth context so this component stays renderable in isolation; the
+  // API refuses the action to anyone but the system administrator
+  // regardless, so this only decides whether the button is shown.
+  canVoid = false,
+}) {
+  const [imageUrl, setImageUrl] = useState(null)
+  const [imageLoading, setImageLoading] = useState(true)
+  const [imageError, setImageError] = useState('')
+  const [reason, setReason] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
+
+  // Enforcement state (CONFIRMED events only).
+  const [enforcementReason, setEnforcementReason] = useState('')
+  const [blockMinutes, setBlockMinutes] = useState(5)
+  // Which destructive action's ConfirmModal is open ('CANCEL_EXAM' |
+  // 'UFM_CASE' | null). BLOCK needs no modal -- it is reversible.
+  const [pendingAction, setPendingAction] = useState(null)
+  const [enforcing, setEnforcing] = useState(false)
+  const [enforcementError, setEnforcementError] = useState('')
+
+  // The status the SERVER returned for a decision recorded in this panel,
+  // or null before any. Held locally because `event` is a row from the
+  // parent's list fetch and keeps its original status until that list
+  // reloads -- this is what lets the panel reflect the new decision (and
+  // reveal enforcement) without closing. Never set optimistically: only
+  // ever assigned from a successful review response.
+  const [reviewedStatus, setReviewedStatus] = useState(null)
+  const [reviewedReason, setReviewedReason] = useState('')
+
+  // Enforcement already recorded against this student's session, so an
+  // admin can see that the exam is (for example) already paused before
+  // stacking a second action on top of it.
+  const [priorActions, setPriorActions] = useState([])
+  const [priorActionsError, setPriorActionsError] = useState('')
+
+  const [voidOpen, setVoidOpen] = useState(false)
+
+  const effectiveStatus = reviewedStatus ?? event.status
+  const isConfirmed = effectiveStatus === 'CONFIRMED'
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl = null
+
+    async function loadImage() {
+      // A violation may have no camera photo (e.g. "Left Exam Screen" on a
+      // screen-share exam): nothing to load, and nothing went wrong.
+      if (event.evidence_id == null) {
+        setImageLoading(false)
+        return
+      }
+      setImageLoading(true)
+      setImageError('')
+      try {
+        const blob = await fetchEvidenceImageBlob(event.evidence_id)
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setImageUrl(objectUrl)
+      } catch (err) {
+        if (!cancelled) {
+          setImageError(getErrorMessage(err, 'Unable to load the evidence image.'))
+        }
+      } finally {
+        if (!cancelled) setImageLoading(false)
+      }
+    }
+
+    loadImage()
+
+    return () => {
+      cancelled = true
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+  }, [event.evidence_id])
+
+  // Read-only context load. A failure here must never block reviewing or
+  // enforcing -- it only hides the history strip and says so.
+  const loadPriorActions = async (signal) => {
+    try {
+      const data = await listEnforcementActions({
+        sessionId: event.session_id,
+        page: 1,
+        pageSize: 10,
+      })
+      if (!signal.cancelled) {
+        setPriorActions(data?.items ?? [])
+        setPriorActionsError('')
+      }
+    } catch (err) {
+      if (!signal.cancelled) {
+        setPriorActions([])
+        setPriorActionsError(
+          getErrorMessage(err, 'Unable to load previous enforcement actions for this session.'),
+        )
+      }
+    }
+  }
+
+  useEffect(() => {
+    const signal = { cancelled: false }
+    loadPriorActions(signal)
+    return () => {
+      signal.cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [event.session_id])
+
+  const handleReview = async (action) => {
+    setSubmitting(true)
+    setSubmitError('')
+    try {
+      const result =
+        event.evidence_id != null
+          ? await reviewEvidence(event.evidence_id, action, reason.trim() || undefined)
+          : await reviewMonitoringEvent(event.id, action, reason.trim() || undefined)
+
+      if (action === 'CONFIRMED') {
+        // Stay open on the server's actual resulting status so the
+        // enforcement ladder becomes reachable for the violation the admin
+        // is already looking at, instead of making them reopen it. The
+        // list behind the panel is refreshed regardless, so it never shows
+        // a stale PENDING_REVIEW row.
+        setReviewedStatus(result?.status ?? 'CONFIRMED')
+        setReviewedReason(reason.trim())
+        setSubmitting(false)
+        onRefresh?.()
+        return
+      }
+
+      // IGNORED needs no follow-up action, so the review ends here: the
+      // parent closes this panel and refetches, exactly as before.
+      onReviewed(result)
+    } catch (err) {
+      setSubmitError(getErrorMessage(err, 'Unable to record this review. Please try again.'))
+      setSubmitting(false)
+    }
+  }
+
+  // Remarks are optional. The enforcement log still needs a reason, so a
+  // blank remark becomes a factual default naming the confirmed violation.
+  const defaultEnforcementReason = `Confirmed ${eventTypeLabel(event.event_type)} violation (#${event.id})`
+  const effectiveEnforcementReason =
+    enforcementReason.trim().length >= 3 ? enforcementReason.trim() : defaultEnforcementReason
+
+  const requestEnforcement = (actionType) => {
+    setEnforcementError('')
+    setPendingAction(actionType)
+  }
+
+  const handleEnforce = async (actionType, minutes = null) => {
+    setEnforcing(true)
+    setEnforcementError('')
+    try {
+      const result = await createEnforcementAction({
+        session_id: event.session_id,
+        action_type: actionType,
+        reason: effectiveEnforcementReason,
+        event_id: event.id,
+        ...(minutes !== null ? { block_minutes: minutes } : {}),
+      })
+      // Same callback chain as a review decision: the parent closes this
+      // panel and refetches, so the action is visible in the enforcement
+      // log rather than silently applied from a stale modal.
+      onReviewed(result)
+    } catch (err) {
+      setEnforcementError(
+        getErrorMessage(err, 'Unable to record this enforcement action. Please try again.'),
+      )
+      setEnforcing(false)
+    }
+  }
+
+  // Clamp defensively on use (not on change): clamping while typing makes
+  // the field fight the admin, and the backend would reject out-of-range
+  // minutes with a 422 anyway.
+  const clampedBlockMinutes = Math.min(60, Math.max(1, Number(blockMinutes) || 5))
+
+  // Keyboard shortcuts: C confirm, I ignore, Esc close -- ignored while
+  // typing in a field or while a confirmation dialog is open.
+  const busy = submitting || enforcing
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || pendingAction || voidOpen) return
+      const tag = e.target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      const key = e.key.toLowerCase()
+      if (key === 'escape' && !busy) onClose()
+      else if (key === 'c' && !busy && !isConfirmed) handleReview('CONFIRMED')
+      else if (key === 'i' && !busy) handleReview('IGNORED')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
+  return (
+    <div
+      className="modal-backdrop-manual"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="evidence-review-title"
+    >
+      <div
+        className="modal-dialog modal-lg"
+        style={{ margin: 0, width: '100%', maxWidth: 'min(760px, 92vw)' }}
+      >
+        <div className="modal-content evidence-review-modal-content">
+          <div className="modal-header">
+            <h5 className="modal-title" id="evidence-review-title">
+              Evidence Review
+            </h5>
+            <button
+              type="button"
+              className="btn-close"
+              aria-label="Close"
+              onClick={onClose}
+              disabled={submitting}
+            />
+          </div>
+          <div className="modal-body">
+            {/* For "Left Exam Screen" the screenshots of what the student
+                opened are the evidence, so they come first. */}
+            {event.event_type === 'LEFT_EXAM_SCREEN' && (
+              <section className="mb-3" aria-labelledby="screen-captures-title">
+                <h3 id="screen-captures-title" className="h6 mb-2">
+                  What the student opened
+                </h3>
+                <ScreenCaptureTimeline eventId={event.id} />
+              </section>
+            )}
+            <div className="row g-3 align-items-start">
+              {event.evidence_id != null && (
+                <div className="col-12 col-md-5">
+                  {imageLoading && <p className="text-muted small mb-0">Loading evidence image...</p>}
+                  {imageError && <p className="text-danger small mb-0">{imageError}</p>}
+                  {imageUrl && (
+                    <img
+                      src={imageUrl}
+                      alt="Camera photo captured for this monitoring event"
+                      className="img-fluid rounded border"
+                    />
+                  )}
+                </div>
+              )}
+              {event.evidence_id == null && event.event_type !== 'LEFT_EXAM_SCREEN' && (
+                <div className="col-12 col-md-5">
+                  <div className="evidence-placeholder small text-muted">
+                    No camera photo for this activity.
+                  </div>
+                </div>
+              )}
+              <div className={event.evidence_id == null && event.event_type === 'LEFT_EXAM_SCREEN' ? 'col-12' : 'col-12 col-md-7'}>
+                <dl className="row gy-2 small mb-0">
+                  <dt className="col-5">Student</dt>
+                  <dd className="col-7">
+                    {event.student_full_name} ({event.student_id})
+                  </dd>
+                  <dt className="col-5">Exam</dt>
+                  <dd className="col-7">{event.exam_title}</dd>
+                  <dt className="col-5">Activity</dt>
+                  <dd className="col-7">{eventTypeLabel(event.event_type)}</dd>
+                  <dt className="col-5">Severity</dt>
+                  <dd className="col-7">
+                    <span className={`badge ${severityBadgeClass(event.severity)}`}>
+                      {severityLabel(event.severity)}
+                    </span>
+                  </dd>
+                  <dt className="col-5">Status</dt>
+                  <dd className="col-7">
+                    <span className={`badge ${eventStatusBadgeClass(effectiveStatus)}`}>
+                      {eventStatusLabel(effectiveStatus)}
+                    </span>
+                    {reviewedStatus && (
+                      <span className="text-muted small ms-2">recorded just now</span>
+                    )}
+                  </dd>
+                  <dt className="col-5">Confidence</dt>
+                  <dd className="col-7">{(event.confidence * 100).toFixed(1)}%</dd>
+                  <dt className="col-5">Duration</dt>
+                  <dd className="col-7">{Number(event.duration_seconds).toFixed(2)}s</dd>
+                  <dt className="col-5">Detected At</dt>
+                  <dd className="col-7">{formatDateTimePKT(event.detected_at)}</dd>
+                </dl>
+              </div>
+            </div>
+
+            {/* Once a decision is recorded the review reason becomes a
+                read-only summary. Leaving it editable alongside the
+                enforcement section's own required reason would put two
+                near-identical boxes on screen with only one of them still
+                doing anything. */}
+            {reviewedStatus ? (
+              <div className="mt-3 small">
+                <span className="text-muted">Remarks: </span>
+                {reviewedReason ? (
+                  <span>{reviewedReason}</span>
+                ) : (
+                  <span className="text-muted fst-italic">none given</span>
+                )}
+              </div>
+            ) : (
+              <div className="mt-3">
+                <input
+                  id="review-reason"
+                  type="text"
+                  className="form-control form-control-sm"
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  disabled={submitting}
+                  maxLength={1000}
+                  placeholder="Remarks (optional)"
+                  aria-label="Remarks (optional)"
+                />
+              </div>
+            )}
+
+            {submitError && <p className="text-danger small mt-2 mb-0">{submitError}</p>}
+
+            {/* Enforcement already on this session -- shown whatever the
+                review status is, so an admin about to confirm can see the
+                student is (say) already paused. Read-only. */}
+            {priorActions.length > 0 && (
+              <div className="mt-4 pt-3 border-top">
+                <h3 className="h6 mb-2">Enforcement on this session</h3>
+                <ul className="list-unstyled mb-0 d-flex flex-column gap-2">
+                  {priorActions.map((action) => (
+                    <li key={action.id} className="d-flex flex-wrap align-items-center gap-2 small">
+                      <span className={`badge ${actionTypeBadgeClass(action.action_type)}`}>
+                        {actionTypeLabel(action.action_type)}
+                      </span>
+                      <span className={`badge ${enforcementStatusBadgeClass(action.effective_status)}`}>
+                        {enforcementStatusLabel(action.effective_status)}
+                      </span>
+                      <span className="text-muted">
+                        by {action.admin_username} · {formatDateTimePKT(action.created_at)}
+                      </span>
+                      <span className="text-truncate" style={{ maxWidth: '100%' }}>
+                        {action.reason}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {priorActionsError && (
+              <p className="text-muted small mt-3 mb-0">{priorActionsError}</p>
+            )}
+
+            {isConfirmed && (
+              <div className="mt-4 pt-3 border-top">
+                <h2 className="h6 mb-1">Enforcement</h2>
+                <p className="text-muted small mb-2">
+                  Confirmed. Take an action against {event.student_full_name} if needed; every
+                  action is recorded in the enforcement log.
+                </p>
+
+                <input
+                  id="enforcement-reason"
+                  type="text"
+                  className="form-control form-control-sm"
+                  value={enforcementReason}
+                  onChange={(e) => setEnforcementReason(e.target.value)}
+                  disabled={submitting || enforcing}
+                  maxLength={1000}
+                  placeholder={`Remarks (optional) - default: ${defaultEnforcementReason}`}
+                  aria-label="Enforcement remarks (optional)"
+                />
+
+                <div className="d-flex flex-wrap align-items-center gap-2 mt-3">
+                  <div className="input-group input-group-sm" style={{ maxWidth: '230px' }}>
+                    <input
+                      id="block-minutes"
+                      type="number"
+                      className="form-control"
+                      min="1"
+                      max="60"
+                      value={blockMinutes}
+                      onChange={(e) => setBlockMinutes(e.target.value)}
+                      disabled={submitting || enforcing}
+                      aria-label="Pause duration in minutes"
+                    />
+                    <span className="input-group-text">min</span>
+                    <button
+                      type="button"
+                      className="btn btn-warning"
+                      onClick={() => handleEnforce('BLOCK', clampedBlockMinutes)}
+                      disabled={submitting || enforcing}
+                    >
+                      Pause Exam
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    onClick={() => requestEnforcement('CANCEL_EXAM')}
+                    disabled={submitting || enforcing}
+                  >
+                    Cancel Exam
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger"
+                    onClick={() => requestEnforcement('UFM_CASE')}
+                    disabled={submitting || enforcing}
+                  >
+                    File UFM Case
+                  </button>
+                </div>
+
+                {enforcementError && (
+                  <p className="text-danger small mt-2 mb-0">{enforcementError}</p>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="modal-footer">
+            <span className="text-muted small me-auto d-none d-md-inline">
+              Shortcuts: <kbd>C</kbd> confirm &middot; <kbd>I</kbd> ignore &middot; <kbd>Esc</kbd> close
+            </span>
+            {canVoid && (
+              <button
+                type="button"
+                className="btn btn-outline-danger"
+                onClick={() => setVoidOpen(true)}
+                disabled={submitting || enforcing}
+              >
+                Void Violation
+              </button>
+            )}
+            {/* After a decision is recorded in this panel, "Confirm" would
+                only append a duplicate audit row saying the same thing, so
+                it is replaced by Done. Mark Ignored stays available: it is
+                a genuine reversal, and the backend records it as another
+                audit entry rather than editing the first. */}
+            <button
+              type="button"
+              className="btn btn-outline-dark"
+              onClick={() => handleReview('IGNORED')}
+              disabled={submitting || enforcing}
+            >
+              {reviewedStatus ? 'Change to Ignored' : 'Mark Ignored'}
+            </button>
+            {isConfirmed ? (
+              <button
+                type="button"
+                className="btn btn-success"
+                onClick={() => onReviewed(null)}
+                disabled={submitting || enforcing}
+              >
+                Done
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-success"
+                onClick={() => handleReview('CONFIRMED')}
+                disabled={submitting || enforcing}
+              >
+                Confirm
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Nested confirmations for the destructive actions: rendered after
+          the dialog (later in DOM order) so they paint above it while
+          staying inside this panel's root element. */}
+      {pendingAction === 'CANCEL_EXAM' && (
+        <ConfirmModal
+          title="Cancel This Exam?"
+          confirmLabel={enforcing ? 'Cancelling...' : 'Cancel Exam'}
+          confirmVariant="danger"
+          confirmDisabled={enforcing}
+          onConfirm={() => handleEnforce('CANCEL_EXAM')}
+          onCancel={() => !enforcing && setPendingAction(null)}
+        >
+          <p>
+            You are cancelling <strong>{event.student_full_name}</strong>&apos;s attempt at{' '}
+            <strong>{event.exam_title}</strong>.
+          </p>
+          <ul className="small text-muted mb-2">
+            <li>The session is ended immediately and marked as cancelled.</li>
+            <li>The score is voided and recorded as 0.</li>
+            <li>The student cannot retake this exam.</li>
+            <li>This action cannot be undone.</li>
+          </ul>
+          <p className="mb-0 small">
+            Reason: <em>{effectiveEnforcementReason}</em>
+          </p>
+        </ConfirmModal>
+      )}
+
+      {voidOpen && (
+        <VoidConfirmDialog
+          title="Void This Violation?"
+          recordLabel={`${eventTypeLabel(event.event_type)} for ${event.student_full_name}`}
+          consequences={[
+            'It leaves the review queue, the dashboard counts and every report.',
+            'Its evidence image is withdrawn with it.',
+            'Any review decision recorded against it stops being listed.',
+          ]}
+          onConfirm={(payload) => voidMonitoringEvent(event.id, payload)}
+          onCancel={() => setVoidOpen(false)}
+          onVoided={() => {
+            setVoidOpen(false)
+            // Closes the panel and refetches: the violation no longer
+            // exists as far as every list is concerned.
+            onReviewed(null)
+          }}
+        />
+      )}
+
+      {pendingAction === 'UFM_CASE' && (
+        <ConfirmModal
+          title="File UFM Case?"
+          confirmLabel={enforcing ? 'Filing...' : 'File Case'}
+          confirmVariant="danger"
+          confirmDisabled={enforcing}
+          onConfirm={() => handleEnforce('UFM_CASE')}
+          onCancel={() => !enforcing && setPendingAction(null)}
+        >
+          <p>
+            You are filing an Unfair Means (UFM) case against{' '}
+            <strong>{event.student_full_name}</strong> for <strong>{event.exam_title}</strong>.
+          </p>
+          <ul className="small text-muted mb-2">
+            <li>A formal record is added to the student&apos;s academic file.</li>
+            <li>The record is permanent and references this confirmed evidence.</li>
+          </ul>
+          <p className="mb-0 small">
+            Reason: <em>{effectiveEnforcementReason}</em>
+          </p>
+        </ConfirmModal>
+      )}
+    </div>
+  )
+}
